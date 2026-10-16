@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tailscale Panel
+GenericName=Tailnet Manager
+Comment=View tailnet devices and connect or disconnect Tailscale
+Exec=@BIN@
+Icon=tailscale-panel
+Terminal=false
+Categories=Network;
+Keywords=tailscale;vpn;tailnet;wireguard;devices;
+StartupNotify=true
+SingleMainWindow=true

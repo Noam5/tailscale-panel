@@ -1,0 +1,1632 @@
+#!/usr/bin/python3
+"""Tailscale panel - a small Qt window and tray icon for the tailnet.
+
+Shows every device on the tailnet with its address and state, and toggles
+Tailscale on or off. Per device it opens VNC, opens an SSH terminal, or
+mounts the remote home directory over SSHFS at ~/mnt/<device>. Talks to the
+`tailscale` CLI only; no sudo is needed because the user is authorised via
+`tailscale set --operator=<user>`.
+
+    tailscale-panel             open the window
+    tailscale-panel --selftest  parse status and print it, no GUI
+"""
+
+from __future__ import annotations
+
+import getpass
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+TAILSCALE = shutil.which("tailscale") or "/usr/bin/tailscale"
+POLL_MS = 3000          # how often to re-read status
+CMD_TIMEOUT = 5         # seconds, for read-only calls
+TOGGLE_TIMEOUT = 45     # seconds, `up` can be slow
+VNC_PORT = 5900
+REMMINA_DIR = Path.home() / ".local/share/remmina"
+
+CONFIG_FILE = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+               / "tailscale-panel" / "config.json")
+# An empty vnc_command means Remmina, preferring a saved profile for the device.
+REMMINA_AUTO = ""
+# Renaming another device needs the admin API: the CLI can only rename this
+# machine. The key lives in its own owner-only file, not in config.json.
+API_URL = "https://api.tailscale.com/api/v2"
+API_KEY_FILE = CONFIG_FILE.with_name("api-key")
+API_KEYS_PAGE = "https://login.tailscale.com/admin/settings/keys"
+API_TIMEOUT = 15
+# A device name is one DNS label; Tailscale stores it lowercased.
+MACHINE_NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+# Placeholders a VNC command template may use; see vnc_command().
+VNC_PLACEHOLDERS = ("{host}", "{ip}", "{name}", "{port}")
+VNC_PRESETS = (
+    ("Remmina (auto)", REMMINA_AUTO),
+    ("TigerVNC", "vncviewer {host}::{port}"),
+    ("KRDC", "krdc vnc://{host}:{port}"),
+)
+
+SSHFS_DIR = Path.home() / "mnt"          # one subdirectory per device
+# Generous, because a password or passphrase dialog counts against it.
+SSHFS_TIMEOUT = 60
+# reconnect plus keepalives so a suspended laptop or a roaming address
+# recovers instead of leaving a wedged mount; idmap=user maps the remote
+# owner onto this user, so files do not all show up as somebody else's.
+SSHFS_OPTS = "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user"
+
+# Abstract-namespace socket (the leading NUL): the kernel drops it when the
+# owning process dies, so a crash leaves no stale file to clean up. Keyed by
+# uid so two users on one machine each get their own panel.
+SINGLE_INSTANCE_ADDR = f"\0tailscale-panel-{os.getuid()}"
+
+# The launcher and window icon, installed by install.sh as
+# ~/.local/share/icons/hicolor/scalable/apps/tailscale-panel.svg.
+# The tray icon is drawn at runtime instead; see dots_icon().
+APP_ICON = "tailscale-panel"
+
+
+# --------------------------------------------------------------------------
+# CLI layer - no Qt in here, so it can be tested on its own
+# --------------------------------------------------------------------------
+
+class TailscaleError(Exception):
+    pass
+
+
+class ApiKeyError(TailscaleError):
+    """The API refused the key itself: expired, revoked, or not allowed."""
+
+
+@dataclass
+class Device:
+    name: str
+    ip: str
+    os: str
+    online: bool
+    active: bool = False
+    is_self: bool = False
+    rx: int = 0
+    tx: int = 0
+    last_seen: str = ""
+    relay: str = ""
+    node_id: str = ""
+    machine: str = ""   # the tailnet device name, first label of DNSName
+
+    @property
+    def short(self) -> str:
+        """The OS hostname. Connections, mount points and SSH users key off
+        this, since /etc/hosts and VNC certificates know only hostnames."""
+        return self.name.split(".")[0]
+
+    @property
+    def label(self) -> str:
+        """The device name as the tailnet shows it, which renaming changes."""
+        return self.machine or self.short
+
+    @property
+    def reachable(self) -> bool:
+        """Online per the control plane, or currently passing traffic.
+
+        The two disagree for a while after a reconnect: `Online` is the
+        control plane's view and lags, `Active` means packets are flowing
+        right now. A peer you are mid-session with must not read as offline.
+        """
+        return self.online or self.active
+
+
+@dataclass
+class Status:
+    state: str = "Unknown"
+    self_ip: str = ""
+    self_name: str = ""
+    tailnet: str = ""
+    auth_url: str = ""
+    devices: list[Device] = field(default_factory=list)
+
+    @property
+    def running(self) -> bool:
+        return self.state == "Running"
+
+    @property
+    def needs_login(self) -> bool:
+        return self.state == "NeedsLogin"
+
+
+class TailscaleClient:
+    """Thin wrapper over the tailscale CLI."""
+
+    def __init__(self, exe: str = TAILSCALE) -> None:
+        self.exe = exe
+
+    def _run(self, args: list[str], timeout: int) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                [self.exe, *args],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except FileNotFoundError:
+            raise TailscaleError(f"{self.exe} not found") from None
+        except subprocess.TimeoutExpired:
+            raise TailscaleError(f"`tailscale {args[0]}` timed out") from None
+
+    def status(self) -> Status:
+        # Note: exit code is non-zero when stopped or logged out, but stdout
+        # still carries usable JSON - so parse first and only then complain.
+        proc = self._run(["status", "--json"], CMD_TIMEOUT)
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            raise TailscaleError((proc.stderr or "no output from tailscale").strip())
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TailscaleError(f"could not parse status: {exc}") from None
+        return self._parse(data)
+
+    @staticmethod
+    def _parse(data: dict) -> Status:
+        st = Status(state=data.get("BackendState") or "Unknown")
+        st.auth_url = data.get("AuthURL") or ""
+
+        tailnet = data.get("CurrentTailnet") or {}
+        st.tailnet = tailnet.get("Name") or ""
+
+        me = data.get("Self") or {}
+        my_ips = me.get("TailscaleIPs") or []
+        st.self_ip = my_ips[0] if my_ips else ""
+        st.self_name = (me.get("HostName") or "").split(".")[0]
+        if me:
+            st.devices.append(Device(
+                name=me.get("HostName") or "this machine",
+                ip=st.self_ip, os=me.get("OS") or "",
+                online=st.state == "Running",
+                active=bool(me.get("Active")), is_self=True,
+                rx=me.get("RxBytes") or 0, tx=me.get("TxBytes") or 0,
+                node_id=me.get("ID") or "",
+                machine=(me.get("DNSName") or "").split(".")[0],
+            ))
+
+        for peer in (data.get("Peer") or {}).values():
+            # Sharee nodes are other tailnets' machines visible to this one,
+            # mostly Funnel ingress relays. `tailscale status` hides them too.
+            if peer.get("ShareeNode"):
+                continue
+            ips = peer.get("TailscaleIPs") or []
+            st.devices.append(Device(
+                name=peer.get("HostName") or peer.get("DNSName") or "?",
+                ip=ips[0] if ips else "",
+                os=peer.get("OS") or "",
+                online=bool(peer.get("Online")),
+                active=bool(peer.get("Active")),
+                rx=peer.get("RxBytes") or 0,
+                tx=peer.get("TxBytes") or 0,
+                last_seen=peer.get("LastSeen") or "",
+                relay=peer.get("Relay") or "",
+                node_id=peer.get("ID") or "",
+                machine=(peer.get("DNSName") or "").split(".")[0],
+            ))
+
+        # self first, then online peers, then the rest - each alphabetical
+        st.devices.sort(key=lambda d: (not d.is_self, not d.reachable, d.label.lower()))
+        return st
+
+    def up(self) -> str:
+        proc = self._run(["up"], TOGGLE_TIMEOUT)
+        out = f"{proc.stdout}\n{proc.stderr}"
+        if proc.returncode != 0:
+            url = re.search(r"https://login\.tailscale\.com/\S+", out)
+            if url:
+                return url.group(0)
+            raise _cli_error(proc, "could not connect")
+        return ""
+
+    def down(self) -> None:
+        proc = self._run(["down"], TOGGLE_TIMEOUT)
+        if proc.returncode != 0:
+            raise _cli_error(proc, "could not disconnect")
+
+    def set_hostname(self, name: str) -> None:
+        """Rename this machine on the tailnet; "" goes back to the OS hostname.
+
+        No API key needed, unlike renaming another device. The device name
+        follows only while it is generated from the hostname, so the caller
+        should check what the tailnet actually made of it.
+        """
+        proc = self._run(["set", f"--hostname={name}"], TOGGLE_TIMEOUT)
+        if proc.returncode != 0:
+            raise _cli_error(proc, "could not set the hostname")
+
+
+def _first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _cli_error(proc: subprocess.CompletedProcess, fallback: str) -> TailscaleError:
+    """The CLI's own complaint, plus the fix when it is a permissions one."""
+    out = f"{proc.stdout}\n{proc.stderr}"
+    if "Access denied" in out:
+        return TailscaleError(
+            "Tailscale refused: your user is not its operator. Run this once:\n"
+            "    sudo tailscale set --operator=$USER")
+    return TailscaleError(_first_line(out) or fallback)
+
+
+def human_bytes(n: int) -> str:
+    if not n:
+        return "-"
+    step = 1024.0
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < step or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= step
+    return f"{n:.1f} TiB"
+
+
+def resolvable(host: str) -> bool:
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except OSError:
+        return False
+
+
+def preferred_target(dev: Device) -> str:
+    """Hostname when it actually resolves, else the tailnet IP.
+
+    Names matter for VNC: the server's certificate is issued to its hostname,
+    so connecting by IP fails verification. But without MagicDNS only names in
+    /etc/hosts resolve, so fall back to the address otherwise.
+    """
+    short = dev.short
+    return short if short and resolvable(short) else dev.ip
+
+
+def bracketed(host: str) -> str:
+    """An IPv6 address in [brackets], as URLs and sshfs's host: need it."""
+    return f"[{host}]" if ":" in host else host
+
+
+def find_vnc_profile(dev: Device) -> Path | None:
+    """An existing Remmina VNC profile for this device, if there is one.
+
+    Preferred over a bare vnc:// URI because the profile carries the pinned
+    CA certificate and the saved password.
+    """
+    if not REMMINA_DIR.is_dir():
+        return None
+    wanted = {dev.short.lower(), dev.ip}
+    matches: list[tuple[int, str, Path]] = []
+    for path in sorted(REMMINA_DIR.glob("*.remmina")):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        proto = re.search(r"^protocol=(.*)$", text, re.M)
+        server = re.search(r"^server=(.*)$", text, re.M)
+        if not proto or not server or proto.group(1).strip().upper() != "VNC":
+            continue
+        host = server.group(1).strip().rsplit(":", 1)[0].lower()
+        if host not in wanted:
+            continue
+        # A profile with a pinned CA is the one that can actually complete a
+        # VeNCrypt/X509 handshake, so rank those first.
+        ca = re.search(r"^cacert=(.+)$", text, re.M)
+        matches.append((0 if ca and ca.group(1).strip() else 1, path.name, path))
+    if not matches:
+        return None
+    matches.sort()
+    return matches[0][2]
+
+
+# --------------------------------------------------------------------------
+# Settings - VNC client and per-device SSH users, kept in ~/.config/tailscale-panel
+# --------------------------------------------------------------------------
+
+# A conservative POSIX-style login name. Above all it cannot start with "-":
+# sshfs gets "user@host:" as one argument, which would then read as an option.
+SSH_USER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\$?")
+
+
+def valid_ssh_user(user: str) -> bool:
+    return bool(SSH_USER_RE.fullmatch(user))
+
+
+@dataclass
+class Config:
+    vnc_command: str = REMMINA_AUTO
+    vnc_port: int = VNC_PORT
+    # device short name -> remote login; a device not listed gets ssh's
+    # default, i.e. ~/.ssh/config or the local user name
+    ssh_users: dict[str, str] = field(default_factory=dict)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        print(f"tailscale-panel: ignoring {path}: {exc}", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config(path: Path = CONFIG_FILE) -> Config:
+    """Settings from disk; anything missing or malformed keeps its default."""
+    data = _read_json(path)
+    cfg = Config()
+    command = data.get("vnc_command")
+    if isinstance(command, str):
+        cfg.vnc_command = command
+    port = data.get("vnc_port")
+    # bool is an int subclass, and `true` is not a port.
+    if isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536:
+        cfg.vnc_port = port
+    users = data.get("ssh_users")
+    if isinstance(users, dict):
+        cfg.ssh_users = {name: user for name, user in users.items()
+                         if isinstance(user, str) and valid_ssh_user(user)}
+    return cfg
+
+
+def save_config(cfg: Config, path: Path = CONFIG_FILE) -> None:
+    """Write the settings, keeping any keys this version does not know about.
+
+    Written to a temporary file and renamed over the old one, so a crash
+    mid-write cannot leave a truncated config behind.
+    """
+    data = _read_json(path)
+    data["vnc_command"] = cfg.vnc_command
+    data["vnc_port"] = cfg.vnc_port
+    data["ssh_users"] = dict(sorted(cfg.ssh_users.items()))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def vnc_command(dev: Device, cfg: Config) -> tuple[list[str], str]:
+    """The command that opens VNC to this device, and a note for the status line.
+
+    A template is split like a shell would split it, then each placeholder is
+    filled in within its own argument. No shell ever runs it, so a device name
+    with spaces or quotes stays one argument and cannot inject anything.
+    Raises ValueError when the template's quoting does not balance.
+    """
+    host = preferred_target(dev)
+    if not cfg.vnc_command.strip():
+        profile = find_vnc_profile(dev)
+        if profile:
+            return ["remmina", "-c", str(profile)], f"Remmina profile {profile.name}"
+        url = f"vnc://{bracketed(host)}:{cfg.vnc_port}"
+        return ["remmina", "-c", url], url
+
+    values = dict(zip(VNC_PLACEHOLDERS,
+                      (host, dev.ip, dev.short, str(cfg.vnc_port))))
+    argv = []
+    for word in shlex.split(cfg.vnc_command):
+        for key, value in values.items():
+            word = word.replace(key, value)
+        argv.append(word)
+    return argv, shlex.join(argv)
+
+
+def ssh_user(dev: Device, cfg: Config) -> str:
+    """The remote login set for this device, or "" to leave it to ssh."""
+    return cfg.ssh_users.get(dev.short, "")
+
+
+def ssh_args(target: str, user: str) -> list[str]:
+    """ssh's destination arguments. -l rather than user@, so an IPv6
+    target needs no special casing."""
+    return ["-l", user, target] if user else [target]
+
+
+def ssh_label(target: str, user: str) -> str:
+    return f"{user}@{target}" if user else target
+
+
+# --------------------------------------------------------------------------
+# Admin API - renaming devices
+# --------------------------------------------------------------------------
+
+def load_api_key(path: Path = API_KEY_FILE) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def save_api_key(key: str, path: Path = API_KEY_FILE) -> None:
+    """Write the key readable by the owner only, from the first byte on."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)                # O_CREAT's mode skips existing files
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+
+
+def forget_api_key(path: Path = API_KEY_FILE) -> None:
+    path.unlink(missing_ok=True)
+
+
+def rename_device(node_id: str, name: str, key: str) -> None:
+    """Set a device's tailnet name; an empty name resets it to the OS hostname.
+
+    Raises ApiKeyError when the key itself is refused, TailscaleError otherwise.
+    """
+    req = urllib.request.Request(
+        f"{API_URL}/device/{urllib.parse.quote(node_id, safe='')}/name",
+        data=json.dumps({"name": name}).encode(), method="POST",
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT):
+            return
+    except urllib.error.HTTPError as exc:
+        try:
+            message = json.loads(exc.read()).get("message") or ""
+        except (ValueError, AttributeError, OSError):
+            message = ""
+        if exc.code == 401:
+            raise ApiKeyError("Tailscale rejected the API key "
+                              "(expired or revoked?)") from None
+        if exc.code == 403:
+            raise ApiKeyError("the API key is not allowed to rename devices"
+                              + (f": {message}" if message else "")) from None
+        raise TailscaleError(f"rename failed: {message or f'HTTP {exc.code}'}") from None
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise TailscaleError(f"could not reach api.tailscale.com: {reason}") from None
+
+
+# --------------------------------------------------------------------------
+# SSHFS - mount a device's home directory under ~/mnt/<device>
+# --------------------------------------------------------------------------
+
+def display_path(path: str | Path) -> str:
+    """~/mnt/foo rather than /home/you/mnt/foo, for labels and messages."""
+    text = str(path)
+    home = str(Path.home())
+    if text == home or text.startswith(home + "/"):
+        return "~" + text[len(home):]
+    return text
+
+
+def mount_point(dev: Device) -> Path:
+    """Where this device's home directory gets mounted.
+
+    Named after the device rather than its address, so the path stays put
+    when the tailnet hands out a different IP. A device with no name falls
+    back to its address, which is then all we have to tell it apart by.
+    """
+    return SSHFS_DIR / (dev.short or dev.ip or "unknown")
+
+
+def mounted_points() -> set[str]:
+    """Every mounted path on this machine, read in one pass.
+
+    mountinfo escapes space, tab, newline and backslash in the mount point
+    as octal, so undo that before comparing against a real path.
+    """
+    try:
+        raw = Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return set()
+    points = set()
+    for line in raw.splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4:
+            points.add(re.sub(r"\\([0-7]{3})",
+                              lambda m: chr(int(m.group(1), 8)), fields[4]))
+    return points
+
+
+def is_mounted(dev: Device) -> bool:
+    return str(mount_point(dev)) in mounted_points()
+
+
+def _askpass_env() -> tuple[dict[str, str], bool]:
+    """An environment in which ssh can ask for a password with no terminal.
+
+    sshfs is started from the GUI, so ssh has no tty to prompt on: without
+    a helper it gives up on password auth. `force` makes ssh use the helper
+    even though stdin is technically still open. Also reports whether a
+    helper was found at all.
+    """
+    helper = shutil.which("ksshaskpass") or shutil.which("ssh-askpass")
+    env = dict(os.environ)
+    if not helper:
+        return env, False
+    env["SSH_ASKPASS"] = helper
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    return env, True
+
+
+def _diagnose(target: str, user: str = "") -> str:
+    """Ask ssh why sshfs could not connect.
+
+    sshfs daemonises before it execs ssh, so ssh's own diagnostic goes to
+    the void and every failure surfaces as "read: Connection reset by
+    peer". One throwaway ssh gives the real reason - refused, unresolved,
+    timed out, host key changed - which is why this runs only after a
+    failure, never on the way in.
+    """
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+             *ssh_args(target, user), "true"],
+            capture_output=True, text=True, timeout=15,
+            stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode == 0:
+        return ""                       # ssh is fine; the fault was sshfs's
+    for line in (proc.stderr or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("Warning: Permanently added"):
+            return line
+    return ""
+
+
+def _rmdir_quietly(point: Path) -> None:
+    """Drop an empty mount point; leave one with anything in it alone."""
+    try:
+        point.rmdir()
+    except OSError:
+        pass
+
+
+def mount_sshfs(dev: Device, user: str = "") -> str:
+    """Mount the device's home directory as `user` (ssh's default when
+    empty). Returns the mount point."""
+    if not shutil.which("sshfs"):
+        raise TailscaleError("sshfs is not installed (apt install sshfs)")
+    point = mount_point(dev)
+    if str(point) in mounted_points():
+        return str(point)
+    target = preferred_target(dev)
+    if not target:
+        raise TailscaleError(f"{dev.short or 'that device'} has no address")
+    try:
+        point.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise TailscaleError(
+            f"could not create {display_path(point)}: {exc.strerror}") from None
+
+    env, has_askpass = _askpass_env()
+    remote = f"{ssh_label(bracketed(target), user)}:"
+    args = ["sshfs", remote, str(point), "-o", SSHFS_OPTS]
+    if not has_askpass:
+        # Nothing on this machine can ask for a password, so fail with a
+        # reason instead of hanging on a prompt nobody will ever see.
+        args += ["-o", "BatchMode=yes"]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=SSHFS_TIMEOUT, env=env,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        _rmdir_quietly(point)
+        raise TailscaleError(f"sshfs to {dev.short} timed out") from None
+    if proc.returncode != 0:
+        _rmdir_quietly(point)
+        reason = (_diagnose(target, user)
+                  or _first_line(f"{proc.stderr}\n{proc.stdout}")
+                  or f"exit status {proc.returncode}")
+        raise TailscaleError(f"could not mount {dev.short}: {reason}")
+    return str(point)
+
+
+def unmount_sshfs(dev: Device) -> str:
+    """Unmount the device and remove its now-empty mount point."""
+    point = mount_point(dev)
+    if str(point) not in mounted_points():
+        _rmdir_quietly(point)
+        return str(point)
+    exe = shutil.which("fusermount3") or shutil.which("fusermount")
+    if not exe:
+        raise TailscaleError("fusermount is not installed")
+    try:
+        proc = subprocess.run([exe, "-u", str(point)], capture_output=True,
+                              text=True, timeout=CMD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise TailscaleError(
+            f"unmounting {display_path(point)} timed out") from None
+    if proc.returncode != 0:
+        raise TailscaleError(
+            _first_line(proc.stderr) or f"could not unmount {display_path(point)}")
+    _rmdir_quietly(point)
+    return str(point)
+
+
+# --------------------------------------------------------------------------
+# Self test - exercises the CLI layer without a display
+# --------------------------------------------------------------------------
+
+def selftest() -> int:
+    client = TailscaleClient()
+    try:
+        st = client.status()
+    except TailscaleError as exc:
+        print(f"FAIL: {exc}")
+        return 1
+
+    print(f"state    : {st.state}")
+    print(f"self     : {st.self_name} {st.self_ip}")
+    print(f"tailnet  : {st.tailnet or '-'}")
+    print(f"auth_url : {st.auth_url or '-'}")
+    print(f"devices  : {len(st.devices)}")
+    cfg = load_config()
+    print(f"vnc      : {cfg.vnc_command or 'Remmina (auto)'}  ·  port {cfg.vnc_port}"
+          f"  ·  config {display_path(CONFIG_FILE)}"
+          f"{'' if CONFIG_FILE.exists() else ' (not written yet)'}")
+    print(f"sshfs    : {shutil.which('sshfs') or 'not installed'}"
+          f"  ·  askpass {_askpass_env()[0].get('SSH_ASKPASS', 'none')}"
+          f"  ·  mounts under {display_path(SSHFS_DIR)}")
+
+    points = mounted_points()
+    for d in st.devices:
+        tag = ("self" if d.is_self else "up" if d.online
+               else "act" if d.active else "down")
+        try:
+            vnc = vnc_command(d, cfg)[1]
+        except ValueError as exc:
+            vnc = f"invalid: {exc}"
+        point = mount_point(d)
+        target = ssh_label(preferred_target(d), ssh_user(d, cfg))
+        print(f"  [{tag:4s}] {d.ip:16s} {d.label:22s} {d.os:8s} "
+              f"rx={human_bytes(d.rx):>10s} target={target:22s} "
+              f"vnc={vnc:30s} "
+              f"sshfs={display_path(point)}"
+              f"{' (mounted)' if str(point) in points else ''}")
+
+    problems = [d for d in st.devices if not d.ip]
+    if problems:
+        print(f"FAIL: {len(problems)} device(s) with no address")
+        return 1
+    if not st.devices:
+        print("FAIL: no devices parsed")
+        return 1
+    print("OK")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Single instance
+# --------------------------------------------------------------------------
+
+def _claim_instance() -> socket.socket | None:
+    """Take ownership of the tray icon, or return None if someone else has it.
+
+    The listening socket doubles as the lock: only one process can hold the
+    address, and later launches connect to it to raise the existing window
+    instead of adding a second icon to the tray.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(SINGLE_INSTANCE_ADDR)
+    except OSError:
+        sock.close()
+        return None
+    sock.listen(4)
+    return sock
+
+
+def _wake_existing() -> bool:
+    """Ask the running panel to show its window. False if nobody answered."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(SINGLE_INSTANCE_ADDR)
+        sock.sendall(b"show")
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+
+def _no_pyside(exc: Exception) -> int:
+    msg = (f"PySide6 is not available to {sys.executable}.\n\n"
+           f"{type(exc).__name__}: {exc}\n\n"
+           "Install it for the system interpreter with:\n"
+           "  sudo apt install python3-pyside6.qtwidgets\n"
+           "then change this script's first line to #!/usr/bin/python3")
+    print(msg, file=sys.stderr)
+    for tool in (["kdialog", "--error", msg], ["notify-send", "Tailscale Panel", msg]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, check=False)
+            break
+    return 1
+
+
+def main() -> int:
+    lock = _claim_instance()
+    if lock is None:
+        # Another panel already owns the tray icon; ask it to come forward.
+        if _wake_existing():
+            return 0
+        # It exited between our bind and our connect, so take the address.
+        lock = _claim_instance()
+        if lock is None:
+            print("another tailscale-panel is starting up", file=sys.stderr)
+            return 1
+
+    try:
+        import PySide6.QtWidgets  # noqa: F401  (probe before the real imports)
+    except Exception as exc:
+        return _no_pyside(exc)
+
+    from PySide6.QtCore import (Qt, QObject, QRunnable, QSocketNotifier, QThreadPool,
+                            QPointF, QTimer, Signal, Slot)
+    from PySide6.QtGui import (QAction, QColor, QGuiApplication, QIcon, QPainter,
+                               QPalette, QPixmap)
+    from PySide6.QtWidgets import (
+        QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+        QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+        QMenu, QMessageBox, QPushButton, QSizePolicy, QSpinBox, QSystemTrayIcon,
+        QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    )
+
+    def dim(label: QLabel) -> QLabel:
+        """Secondary text. The placeholder colour, not palette(mid): on a
+        dark theme mid is nearly the background and the text disappears."""
+        pal = label.palette()
+        pal.setColor(QPalette.WindowText, pal.color(QPalette.PlaceholderText))
+        label.setPalette(pal)
+        return label
+
+    _dots_cache: dict[tuple[bool, int], QIcon] = {}
+
+    def dots_icon(lit: bool) -> QIcon:
+        """Tailscale's 3x3 dots in the theme's text colour, for the tray.
+
+        Connected lights the T (middle row and bottom centre) the way
+        Tailscale's own tray icon does; disconnected fades every dot. Drawn
+        rather than shipped so it follows a light or dark panel.
+        """
+        color = QGuiApplication.palette().color(QPalette.WindowText)
+        key = (lit, color.rgba())
+        if key in _dots_cache:
+            return _dots_cache[key]
+        icon = QIcon()
+        for size in (16, 22, 24, 32, 48, 64):
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(Qt.NoPen)
+            for row in range(3):
+                for col in range(3):
+                    solid = lit and (row == 1 or (row, col) == (2, 1))
+                    dot = QColor(color)
+                    dot.setAlphaF(1.0 if solid else 0.35)
+                    p.setBrush(dot)
+                    p.drawEllipse(QPointF(size * (0.17 + 0.33 * col),
+                                          size * (0.17 + 0.33 * row)),
+                                  size * 0.13, size * 0.13)
+            p.end()
+            icon.addPixmap(pm)
+        _dots_cache[key] = icon
+        return icon
+
+    class _Signals(QObject):
+        done = Signal(object)
+        failed = Signal(str)
+
+    class Task(QRunnable):
+        """Runs one blocking CLI call off the GUI thread.
+
+        The emitter is owned by the window, not by this runnable: QThreadPool
+        deletes a runnable as soon as run() returns, which would otherwise
+        destroy the emitter while a queued cross-thread signal is still in
+        flight - a segfault that only shows up when the timing lines up.
+        """
+
+        def __init__(self, fn, signals):
+            super().__init__()
+            self.fn = fn
+            self.signals = signals
+
+        @Slot()
+        def run(self):
+            try:
+                self.signals.done.emit(self.fn())
+            except TailscaleError as exc:
+                self.signals.failed.emit(str(exc))
+            except Exception as exc:                      # never kill the pool
+                self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+    COLS = ["", "Device", "Address", "OS", "Received", ""]
+
+    class SettingsDialog(QDialog):
+        """Choose the VNC client: a preset, or a command template of your own."""
+
+        CUSTOM = "Custom"
+
+        def __init__(self, cfg: Config, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Tailscale Panel Settings")
+
+            self.client = QComboBox()
+            for label, command in VNC_PRESETS:
+                prog = shlex.split(command)[0] if command else "remmina"
+                if not shutil.which(prog):
+                    label += " (not installed)"
+                self.client.addItem(label, command)
+            self.client.addItem(self.CUSTOM, None)
+
+            self.command = QLineEdit()
+            self.command.setMinimumWidth(360)
+            self.port = QSpinBox()
+            self.port.setRange(1, 65535)
+            self.port.setValue(cfg.vnc_port)
+
+            hint = QLabel(
+                "Placeholders: " + ", ".join(VNC_PLACEHOLDERS) + ". {host} is the "
+                "hostname when it resolves, otherwise the tailnet address.\n"
+                "Remmina (auto) opens the device's saved Remmina profile if "
+                "there is one.")
+            hint.setWordWrap(True)
+            dim(hint)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+
+            form = QFormLayout()
+            form.addRow("VNC client:", self.client)
+            form.addRow("Command:", self.command)
+            form.addRow("Port:", self.port)
+            layout = QVBoxLayout(self)
+            layout.addLayout(form)
+            layout.addWidget(hint)
+            layout.addWidget(buttons)
+
+            presets = [command for _label, command in VNC_PRESETS]
+            current = cfg.vnc_command if cfg.vnc_command.strip() else REMMINA_AUTO
+            self.client.setCurrentIndex(
+                presets.index(current) if current in presets else len(presets))
+            self.command.setText(current)
+            self._sync_command()
+            self.client.currentIndexChanged.connect(self.on_client_changed)
+            # textEdited, not textChanged: only the user's typing, not ours.
+            self.command.textEdited.connect(self.on_command_edited)
+
+        def _sync_command(self):
+            auto = self.client.currentData() == REMMINA_AUTO
+            self.command.setEnabled(not auto)
+            self.command.setPlaceholderText(
+                "remmina -c <saved profile, or vnc://{host}:{port}>" if auto
+                else "e.g. vncviewer {host}::{port}")
+
+        def on_client_changed(self, _index: int):
+            command = self.client.currentData()
+            if command is not None:      # a preset; Custom keeps what is typed
+                self.command.setText(command)
+            self._sync_command()
+
+        def on_command_edited(self, _text: str):
+            if self.client.currentData() is not None:
+                self.client.blockSignals(True)
+                self.client.setCurrentIndex(self.client.count() - 1)
+                self.client.blockSignals(False)
+                self._sync_command()
+
+        def result_config(self) -> Config:
+            command = self.client.currentData()
+            if command is None:
+                command = self.command.text().strip()
+            return Config(vnc_command=command, vnc_port=self.port.value())
+
+        def accept(self):
+            command = self.result_config().vnc_command
+            if command:
+                try:
+                    words = shlex.split(command)
+                except ValueError as exc:
+                    QMessageBox.warning(self, "Settings",
+                                        f"The command is not valid: {exc}.")
+                    return
+                if not shutil.which(words[0]):
+                    answer = QMessageBox.question(
+                        self, "Settings",
+                        f"{words[0] or 'The command'} was not found on PATH. "
+                        "Save anyway?")
+                    if answer != QMessageBox.Yes:
+                        return
+            super().accept()
+
+    class Panel(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.client = TailscaleClient()
+            self.pool = QThreadPool.globalInstance()
+            self.status_signals = _Signals(self)
+            self.status_signals.done.connect(self.on_status)
+            self.status_signals.failed.connect(self.on_status_failed)
+            self.toggle_signals = _Signals(self)
+            self.toggle_signals.done.connect(self.on_toggled)
+            self.toggle_signals.failed.connect(self.on_toggle_failed)
+            self.sshfs_signals = _Signals(self)
+            self.sshfs_signals.done.connect(self.on_sshfs_done)
+            self.sshfs_signals.failed.connect(self.on_sshfs_failed)
+            self.rename_signals = _Signals(self)
+            self.rename_signals.done.connect(self.on_rename_done)
+            self.rename_signals.failed.connect(self.on_rename_failed)
+            self.mounts: set[str] = set()       # refreshed on every render
+            self.sshfs_busy: set[str] = set()   # mount points mid-call
+            self.sshfs_buttons: dict[int, QPushButton] = {}
+            self.status: Status | None = None
+            self.polling = False
+            self.busy = False
+            self._told_about_tray = False
+
+            self.setWindowTitle("Tailscale")
+            self.setWindowIcon(QIcon.fromTheme(APP_ICON, dots_icon(True)))
+            self.resize(720, 420)
+
+            self.heading = QLabel("Reading status…")
+            self.heading.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.subheading = QLabel("")
+            self.subheading.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            dim(self.subheading)
+
+            self.toggle_btn = QPushButton("…")
+            self.toggle_btn.setMinimumWidth(150)
+            self.toggle_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.toggle_btn.clicked.connect(self.on_toggle)
+
+            self.settings_dialog = None
+            settings_btn = QPushButton("Settings…")
+            settings_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            settings_btn.clicked.connect(self.open_settings)
+
+            head_text = QVBoxLayout()
+            head_text.setSpacing(2)
+            head_text.addWidget(self.heading)
+            head_text.addWidget(self.subheading)
+
+            head = QHBoxLayout()
+            head.addLayout(head_text, 1)
+            head.addWidget(settings_btn, 0, Qt.AlignVCenter)
+            head.addWidget(self.toggle_btn, 0, Qt.AlignVCenter)
+
+            self.table = QTableWidget(0, len(COLS))
+            self.table.setHorizontalHeaderLabels(COLS)
+            self.table.verticalHeader().setVisible(False)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.table.setAlternatingRowColors(True)
+            self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.table.customContextMenuRequested.connect(self.on_context_menu)
+            self.table.cellDoubleClicked.connect(
+                lambda row, _col: self.copy_text(self.device_at(row).ip, "Address"))
+            hh = self.table.horizontalHeader()
+            hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            # Interactive, not Stretch: Stretch pins the table to the window
+            # width, so the column can't be dragged wider and no horizontal
+            # scrollbar ever appears. It starts out filling the spare width.
+            hh.setSectionResizeMode(1, QHeaderView.Interactive)
+            self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+            self.names_fitted = False
+            for c in (2, 3, 4, 5):
+                hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+
+            self.statusline = QLabel("")
+            self.statusline.setWordWrap(True)
+            dim(self.statusline)
+
+            layout = QVBoxLayout(self)
+            layout.addLayout(head)
+            layout.addWidget(self.table, 1)
+            layout.addWidget(self.statusline)
+
+            self.tray = None
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self.tray = QSystemTrayIcon(dots_icon(False), self)
+                # Parented and retained: PySide6 does not take ownership
+                # in setContextMenu, so a bare local would be collected.
+                self.tray_menu = menu = QMenu(self)
+                self.act_toggle = QAction("Connect", self)
+                self.act_toggle.triggered.connect(self.on_toggle)
+                act_show = QAction("Show window", self)
+                act_show.triggered.connect(self.show_window)
+                act_settings = QAction("Settings…", self)
+                act_settings.triggered.connect(self.open_settings)
+                act_quit = QAction("Quit", self)
+                act_quit.triggered.connect(QApplication.quit)
+                menu.addAction(self.act_toggle)
+                menu.addAction(act_show)
+                menu.addAction(act_settings)
+                menu.addSeparator()
+                menu.addAction(act_quit)
+                self.tray.setContextMenu(menu)
+                self.tray.activated.connect(self.on_tray_activated)
+                self.tray.show()
+
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.refresh)
+            self.timer.start(POLL_MS)
+            self.refresh()
+
+        # -- data ---------------------------------------------------------
+        def refresh(self):
+            if self.polling or self.busy:
+                return
+            self.polling = True
+            self.pool.start(Task(self.client.status, self.status_signals))
+
+        @Slot(object)
+        def on_status(self, st: Status):
+            self.polling = False
+            self.status = st
+            self.render()
+
+        @Slot(str)
+        def on_status_failed(self, msg: str):
+            self.polling = False
+            # Keep whatever list we already have; just say what went wrong.
+            self.statusline.setText(f"⚠ {msg}")
+
+        def device_at(self, row: int) -> Device:
+            return self.status.devices[row]
+
+        # -- rendering ----------------------------------------------------
+        def render(self):
+            st = self.status
+            if st is None:
+                return
+            self.mounts = mounted_points()
+
+            if st.running:
+                self.heading.setText(
+                    f"<b>Connected</b> — {st.self_ip or 'no address'}")
+                self.toggle_btn.setText("Disconnect")
+            elif st.needs_login:
+                self.heading.setText("<b>Login required</b>")
+                self.toggle_btn.setText("Log in…")
+            else:
+                self.heading.setText(f"<b>Disconnected</b> — {st.state}")
+                self.toggle_btn.setText("Connect")
+            self.toggle_btn.setEnabled(not self.busy)
+
+            bits = [b for b in (st.self_name, st.tailnet) if b]
+            online = sum(1 for d in st.devices if d.reachable and not d.is_self)
+            peers = sum(1 for d in st.devices if not d.is_self)
+            bits.append(f"{online} of {peers} other devices online")
+            self.subheading.setText("  ·  ".join(bits))
+
+            if self.tray:
+                self.tray.setIcon(dots_icon(st.running))
+                self.tray.setToolTip(
+                    f"Tailscale — {'connected ' + st.self_ip if st.running else st.state}")
+                self.act_toggle.setText("Disconnect" if st.running else "Connect")
+
+            self.table.setRowCount(len(st.devices))
+            for row, dev in enumerate(st.devices):
+                dot = QTableWidgetItem("●")
+                if dev.online:
+                    dot.setForeground(QColor("#27ae60"))
+                    dot.setToolTip("Online")
+                elif dev.active:
+                    dot.setForeground(QColor("#f39c12"))
+                    dot.setToolTip("Passing traffic now; control plane still catching up")
+                else:
+                    dot.setForeground(QColor("#95a5a6"))
+                    dot.setToolTip(f"Last seen {dev.last_seen}" if dev.last_seen
+                                   else "Offline")
+                self.table.setItem(row, 0, dot)
+
+                label = dev.label + ("  (this machine)" if dev.is_self else "")
+                name = QTableWidgetItem(label)
+                tips = []
+                if dev.label != dev.short:
+                    tips.append(f"Hostname {dev.short}")
+                if dev.relay:
+                    tips.append(f"Relayed via {dev.relay}")
+                if str(mount_point(dev)) in self.mounts:
+                    tips.append(f"Mounted at {display_path(mount_point(dev))}")
+                if tips:
+                    name.setToolTip("  ·  ".join(tips))
+                self.table.setItem(row, 1, name)
+                self.table.setItem(row, 2, QTableWidgetItem(dev.ip))
+                self.table.setItem(row, 3, QTableWidgetItem(dev.os))
+                rx = QTableWidgetItem(human_bytes(dev.rx))
+                rx.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(row, 4, rx)
+
+                if self.table.cellWidget(row, 5) is None:
+                    self.table.setCellWidget(row, 5, self._actions_widget(row))
+                self._render_sshfs_button(row, dev)
+
+            if not self.statusline.text().startswith("⚠"):
+                self.statusline.setText(
+                    "Double-click a row to copy its address · right-click for more")
+
+            if not self.names_fitted and st.devices and self.table.isVisible():
+                self.names_fitted = True
+                # After this pass, so the other columns have their widths.
+                QTimer.singleShot(0, self._fit_names_column)
+
+        def _fit_names_column(self):
+            """Fit the columns to the window, once: widen the window when
+            they do not fit (as far as the screen allows), then give the
+            Device column whatever is spare.
+
+            After that the width is the user's: dragging it past the window
+            edge brings up a horizontal scrollbar.
+            """
+            self.table.resizeColumnToContents(1)
+            total = sum(self.table.columnWidth(c)
+                        for c in range(self.table.columnCount()))
+            short = total - self.table.viewport().width()
+            screen = self.screen().availableGeometry().width() if self.screen() else 0
+            if short > 0 and screen > self.width():
+                self.resize(min(self.width() + short, screen), self.height())
+            others = total - self.table.columnWidth(1)
+            spare = self.table.viewport().width() - others
+            self.table.setColumnWidth(1, max(self.table.columnWidth(1), spare))
+
+        def _actions_widget(self, row: int) -> QWidget:
+            box = QWidget()
+            lay = QHBoxLayout(box)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            for text, slot in (
+                ("Copy", lambda: self.copy_text(self.device_at(row).ip, "Address")),
+                ("VNC", lambda: self.launch_vnc(self.device_at(row))),
+                ("SSH", lambda: self.launch_ssh(self.device_at(row))),
+            ):
+                btn = QPushButton(text)
+                btn.setFlat(True)
+                btn.clicked.connect(slot)
+                lay.addWidget(btn)
+
+            btn = QPushButton("SSHFS")
+            btn.setFlat(True)
+            btn.clicked.connect(lambda: self.toggle_sshfs(self.device_at(row)))
+            lay.addWidget(btn)
+            # Kept so render() can relabel it: rows are reused, and after a
+            # re-sort this one shows a different device, whose mount state
+            # the label has to follow.
+            self.sshfs_buttons[row] = btn
+            return box
+
+        def _render_sshfs_button(self, row: int, dev: Device):
+            btn = self.sshfs_buttons.get(row)
+            if btn is None:
+                return
+            if dev.is_self:
+                btn.setEnabled(False)
+                btn.setText("SSHFS")
+                btn.setToolTip("This machine")
+                return
+            point = mount_point(dev)
+            if str(point) in self.sshfs_busy:
+                btn.setEnabled(False)
+                btn.setText("…")
+                return
+            btn.setEnabled(True)
+            if str(point) in self.mounts:
+                btn.setText("Unmount")
+                btn.setToolTip(f"Unmount {display_path(point)}")
+            else:
+                btn.setText("SSHFS")
+                btn.setToolTip(
+                    f"Mount {dev.label}'s home directory at {display_path(point)}")
+
+        # -- actions ------------------------------------------------------
+        def on_toggle(self):
+            if self.busy or self.status is None:
+                return
+            st = self.status
+            if st.needs_login and st.auth_url:
+                self.open_url(st.auth_url)
+                return
+
+            self.busy = True
+            self.toggle_btn.setEnabled(False)
+            self.statusline.setText(
+                "Disconnecting…" if st.running else "Connecting…")
+            fn = self.client.down if st.running else self.client.up
+            self.pool.start(Task(fn, self.toggle_signals))
+
+        @Slot(object)
+        def on_toggled(self, result):
+            self.busy = False
+            if isinstance(result, str) and result.startswith("https://"):
+                self.statusline.setText("Login required — opening browser")
+                self.open_url(result)
+            else:
+                self.statusline.setText("")
+            self.refresh()
+
+        @Slot(str)
+        def on_toggle_failed(self, msg: str):
+            self.busy = False
+            self.toggle_btn.setEnabled(True)
+            self.statusline.setText(f"⚠ {msg}")
+            self.refresh()
+
+        def copy_text(self, text: str, what: str):
+            if not text:
+                return
+            QGuiApplication.clipboard().setText(text)
+            self.statusline.setText(f"{what} copied: {text}")
+
+        def launch_vnc(self, dev: Device):
+            # Read on every launch, so a hand edit to the file applies too.
+            try:
+                args, note = vnc_command(dev, load_config())
+            except ValueError as exc:
+                self.warn(f"The VNC command in Settings is not valid: {exc}.")
+                return
+            if not args or not shutil.which(args[0]):
+                self.warn(f"{args[0] if args else 'The VNC client'} is not installed."
+                          " Pick another VNC client in Settings.")
+                return
+            self.spawn(args, f"Opening {note}")
+
+        def open_settings(self):
+            # From the tray the window may be hidden; bring up the one dialog.
+            if self.settings_dialog is not None:
+                self.settings_dialog.raise_()
+                self.settings_dialog.activateWindow()
+                return
+            self.settings_dialog = SettingsDialog(load_config(), self)
+            try:
+                if self.settings_dialog.exec() == QDialog.Accepted:
+                    cfg = self.settings_dialog.result_config()
+                    try:
+                        save_config(cfg)
+                    except OSError as exc:
+                        self.warn(f"Could not save {display_path(CONFIG_FILE)}: {exc}")
+                        return
+                    self.statusline.setText(
+                        f"Settings saved to {display_path(CONFIG_FILE)}")
+            finally:
+                self.settings_dialog.deleteLater()
+                self.settings_dialog = None
+
+        def launch_ssh(self, dev: Device):
+            term = shutil.which("konsole") or shutil.which("x-terminal-emulator")
+            if not term:
+                self.warn("No terminal emulator found.")
+                return
+            target = preferred_target(dev)
+            user = ssh_user(dev, load_config())
+            self.spawn([term, "-e", "ssh", *ssh_args(target, user)],
+                       f"SSH to {ssh_label(target, user)}")
+
+        def rename(self, dev: Device):
+            """Rename the device on the tailnet: this machine through the
+            CLI, any other through the admin API, which needs a key."""
+            key = ""
+            if not dev.is_self:
+                if not dev.node_id:
+                    self.warn(f"Tailscale gave no device ID for {dev.label}.")
+                    return
+                key = load_api_key() or self.ask_api_key()
+                if not key:
+                    return
+            # For this machine dev.short is Tailscale's hostname, which a
+            # previous rename may have overridden; the OS one is the fallback.
+            os_host = socket.gethostname().split(".")[0] if dev.is_self else dev.short
+            name, ok = QInputDialog.getText(
+                self, "Rename device",
+                f"New tailnet name for {dev.label}: lowercase letters, digits "
+                f"and hyphens.\nLeave blank to go back to the OS hostname "
+                f"({os_host}).",
+                QLineEdit.Normal, dev.label)
+            if not ok:
+                return
+            name = name.strip().lower()
+            if name == dev.label:
+                return
+            if name and not MACHINE_NAME_RE.fullmatch(name):
+                self.warn(f"{name!r} is not a valid device name: use lowercase "
+                          "letters, digits and hyphens, not at either end.")
+                return
+
+            def work(dev=dev, name=name, key=key):
+                try:
+                    if dev.is_self:
+                        self.client.set_hostname(name)
+                        return {"old": dev.label, "new": name,
+                                "got": self._wait_for_self_name(dev.label)}
+                    rename_device(dev.node_id, name, key)
+                except ApiKeyError as exc:
+                    return {"error": str(exc), "bad_key": True}
+                except TailscaleError as exc:
+                    return {"error": str(exc)}
+                return {"old": dev.label, "new": name}
+
+            self.pool.start(Task(work, self.rename_signals))
+            self.statusline.setText(f"Renaming {dev.label}…")
+
+        def ask_api_key(self) -> str:
+            key, ok = QInputDialog.getText(
+                self, "Tailscale API key",
+                "Renaming needs a Tailscale API access token. Generate one "
+                f"at\n{API_KEYS_PAGE}\nand paste it here. It is saved, "
+                f"readable only by you, in {display_path(API_KEY_FILE)}.",
+                QLineEdit.Password)
+            key = key.strip()
+            if not ok or not key:
+                return ""
+            if not key.startswith("tskey-"):
+                self.warn("That does not look like a Tailscale key "
+                          "(they start with tskey-).")
+                return ""
+            try:
+                save_api_key(key)
+            except OSError as exc:
+                self.warn(f"Could not save {display_path(API_KEY_FILE)}: {exc}")
+                return ""
+            return key
+
+        def _wait_for_self_name(self, old: str) -> str:
+            """This machine's device name once it moves off `old`, or `old`
+            if it has not moved in a few seconds. Runs on a worker thread.
+
+            The new hostname makes a round trip through the control plane
+            before the device name changes, and does not change it at all
+            when the name was set by hand in the admin console.
+            """
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                try:
+                    st = self.client.status()
+                except TailscaleError:
+                    continue
+                me = next((d for d in st.devices if d.is_self), None)
+                if me and me.label != old:
+                    return me.label
+            return old
+
+        @Slot(object)
+        def on_rename_done(self, result: dict):
+            if result.get("error"):
+                if result.get("bad_key"):
+                    forget_api_key()
+                    self.warn(f"{result['error']}. The saved key was removed; "
+                              "rename again to enter a new one.")
+                else:
+                    self.warn(result["error"])
+                self.statusline.setText("Rename failed")
+                return
+            got = result.get("got")
+            if got == result["old"] and result["new"]:
+                self.warn(
+                    f"Tailscale took the new hostname, but the device name is "
+                    f"still {got}. That happens when it was set by hand in the "
+                    f"admin console: rename it there, or turn its name back to "
+                    f"auto-generated.")
+                self.statusline.setText("Rename did not take effect")
+                return
+            if got and result["new"] and got != result["new"]:
+                self.statusline.setText(
+                    f"Renamed {result['old']} to {got} ({result['new']} was taken)")
+                return
+            # No refresh(): it would overwrite this line at once, and the
+            # next poll shows the new name anyway.
+            self.statusline.setText(
+                f"Renamed {result['old']} to {result['new']}" if result["new"]
+                else f"{result['old']} goes back to a name from its OS hostname")
+
+        @Slot(str)
+        def on_rename_failed(self, msg: str):
+            self.warn(msg)
+
+        def edit_ssh_user(self, dev: Device):
+            cfg = load_config()
+            user, ok = QInputDialog.getText(
+                self, "SSH user",
+                f"Remote user for {dev.label}, used by SSH and SSHFS.\n"
+                f"Leave blank for ssh's default (~/.ssh/config, else "
+                f"{getpass.getuser()}).",
+                QLineEdit.Normal, ssh_user(dev, cfg))
+            if not ok:
+                return
+            user = user.strip()
+            if user and not valid_ssh_user(user):
+                self.warn(f"{user!r} is not a valid user name.")
+                return
+            if user:
+                cfg.ssh_users[dev.short] = user
+            else:
+                cfg.ssh_users.pop(dev.short, None)
+            try:
+                save_config(cfg)
+            except OSError as exc:
+                self.warn(f"Could not save {display_path(CONFIG_FILE)}: {exc}")
+                return
+            self.statusline.setText(
+                f"SSH to {dev.label} as {user}" if user
+                else f"SSH to {dev.label} as ssh's default user")
+
+        def toggle_sshfs(self, dev: Device):
+            """Mount the device's home directory, or unmount it if it is up."""
+            if dev.is_self:
+                return
+            point = str(mount_point(dev))
+            if point in self.sshfs_busy:
+                return
+            mounted = point in mounted_points()
+            if not mounted and not dev.reachable:
+                self.warn(f"{dev.label} is offline.")
+                return
+
+            self.sshfs_busy.add(point)
+            self._render_sshfs_buttons()
+            user = ssh_user(dev, load_config())
+
+            def work(dev=dev, point=point, mounted=mounted, user=user):
+                # Failures come back as data rather than an exception, so the
+                # handler always knows which mount point to release.
+                try:
+                    where = unmount_sshfs(dev) if mounted else mount_sshfs(dev, user)
+                except TailscaleError as exc:
+                    return {"point": point, "error": str(exc)}
+                return {"point": point, "where": where, "mounted": not mounted}
+
+            self.pool.start(Task(work, self.sshfs_signals))
+            self.statusline.setText(
+                f"Unmounting {display_path(point)}…" if mounted
+                else f"Mounting {dev.label} at {display_path(point)}…")
+
+        def _render_sshfs_buttons(self):
+            if self.status is None:
+                return
+            for row, dev in enumerate(self.status.devices):
+                self._render_sshfs_button(row, dev)
+
+        @Slot(object)
+        def on_sshfs_done(self, result: dict):
+            self.sshfs_busy.discard(result["point"])
+            # render() first: it rewrites the status line, so anything we
+            # want the user to read has to be set after it.
+            self.render()
+            if result.get("error"):
+                self.warn(result["error"])
+                return
+            where = display_path(result["where"])
+            if result["mounted"]:
+                self.open_path(result["where"])
+                self.statusline.setText(f"Mounted at {where}")
+            else:
+                self.statusline.setText(f"Unmounted {where}")
+
+        @Slot(str)
+        def on_sshfs_failed(self, msg: str):
+            # Only a bug in work() reaches here, and with no mount point to
+            # go on the safe move is to release every button.
+            self.sshfs_busy.clear()
+            self.render()
+            self.warn(msg)
+
+        def open_path(self, path: str):
+            opener = shutil.which("dolphin") or shutil.which("xdg-open")
+            if not opener:
+                self.warn("No file manager found.")
+                return
+            self.spawn([opener, path], f"Opening {display_path(path)}")
+
+        def spawn(self, args: list[str], note: str):
+            try:
+                subprocess.Popen(args, start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                self.warn(f"Could not run {args[0]}: {exc}")
+                return
+            self.statusline.setText(note)
+
+        def open_url(self, url: str):
+            self.spawn(["xdg-open", url], "Opening browser…")
+
+        def warn(self, msg: str):
+            self.statusline.setText(f"⚠ {msg}")
+            QMessageBox.warning(self, "Tailscale", msg)
+
+        # -- window / tray behaviour --------------------------------------
+        def on_context_menu(self, pos):
+            row = self.table.rowAt(pos.y())
+            if row < 0 or self.status is None or row >= len(self.status.devices):
+                return
+            dev = self.device_at(row)
+            menu = QMenu(self)
+            menu.addAction(f"Copy address  {dev.ip}",
+                           lambda: self.copy_text(dev.ip, "Address"))
+            menu.addAction(f"Copy hostname  {dev.short}",
+                           lambda: self.copy_text(dev.short, "Hostname"))
+            menu.addAction("Rename…", lambda: self.rename(dev))
+            if not dev.is_self:
+                menu.addSeparator()
+                menu.addAction("Open VNC", lambda: self.launch_vnc(dev))
+                menu.addAction("Open SSH", lambda: self.launch_ssh(dev))
+                user = ssh_user(dev, load_config())
+                menu.addAction(f"SSH user…  ({user or 'default'})",
+                               lambda: self.edit_ssh_user(dev))
+                point = mount_point(dev)
+                shown = display_path(point)
+                if str(point) in mounted_points():
+                    menu.addAction(f"Open  {shown}",
+                                   lambda: self.open_path(str(point)))
+                    menu.addAction(f"Unmount  {shown}",
+                                   lambda: self.toggle_sshfs(dev))
+                else:
+                    menu.addAction(f"Mount over SSHFS  →  {shown}",
+                                   lambda: self.toggle_sshfs(dev))
+            menu.exec(self.table.viewport().mapToGlobal(pos))
+
+        def on_tray_activated(self, reason):
+            if reason == QSystemTrayIcon.Trigger:
+                if self.isVisible():
+                    self.hide()
+                else:
+                    self.show_window()
+
+        def show_window(self):
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+        def closeEvent(self, event):
+            if self.tray:
+                event.ignore()
+                self.hide()
+                if not self._told_about_tray:
+                    self._told_about_tray = True
+                    self.tray.showMessage(
+                        "Tailscale", "Still running in the tray.",
+                        QIcon.fromTheme(APP_ICON, dots_icon(True)), 4000)
+            else:
+                event.accept()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Tailscale Panel")
+    app.setDesktopFileName("tailscale-panel")
+    panel = Panel()
+    panel.show()
+
+    # Later launches arrive here rather than starting a second tray icon.
+    notifier = QSocketNotifier(lock.fileno(), QSocketNotifier.Type.Read, panel)
+
+    def on_second_launch():
+        try:
+            conn, _ = lock.accept()
+        except OSError:
+            return
+        with conn:
+            conn.recv(16)
+        panel.show_window()
+
+    notifier.activated.connect(on_second_launch)
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    sys.exit(main())
